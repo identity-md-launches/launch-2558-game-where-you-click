@@ -99,6 +99,12 @@ transaction is needed. Publish and inspect configuration before accepting entrie
 the owner can change it while the entry count is zero. Renouncing ownership before
 configuration would leave the game unusable.
 
+Because a correction can land in the same block as the first entries, wallets
+should quote against `poolId()` and submit the pool-bound entry point described
+below. An entry bound to a pool ID that is no longer configured reverts with
+`PoolMismatch` instead of buying a different token, and the owner should not
+reconfigure once entries are being solicited.
+
 The selected pool must permit this game contract as the swap caller, empty hook
 data, native ETH settlement, and a full 0.08 ETH input. Hooks see the game as their
 sender, not the payer. The game does not provide arbitrary hook data, signatures,
@@ -109,20 +115,25 @@ token as a substitute.
 
 ## Playing and reading results
 
-Send exactly 0.1 ETH to either entry point:
+Send exactly 0.1 ETH to one of three entry points:
 
 ```solidity
 game.mint{value: 0.1 ether}();
 game.mint{value: 0.1 ether}(minTokensReceived, deadline);
+game.mint{value: 0.1 ether}(expectedPoolId, minTokensReceived, deadline);
 ```
 
-Both return `(mintId, tokensReceived)`. Use the second overload for wallet/UI
-integration: take a fresh off-chain quote, supply the user's acceptable minimum,
-and use a short absolute Unix timestamp deadline. The effective minimum is the
-larger of the user minimum and the frozen pool floor. Zero user minimum is rejected.
-The transaction may execute at `deadline` itself, but never at or after `closesAt`.
-The no-argument overload has no per-transaction expiry and relies solely on the
-configured absolute floor; it is not a fresh percentage-slippage quote.
+All return `(mintId, tokensReceived)`. Use the three-argument overload for
+wallet/UI integration: read `poolId()`, take a fresh off-chain quote for that pool,
+supply the user's acceptable minimum, and use a short absolute Unix timestamp
+deadline. If the configured pool is not the one quoted (possible only while the
+game still has no entries), the entry reverts with `PoolMismatch` and nothing is
+bought. The effective minimum is the larger of the user minimum and the frozen pool
+floor. Zero user minimum is rejected. The transaction may execute at `deadline`
+itself, but never at or after `closesAt`. The two-argument overload offers the same
+minimum and deadline without binding the pool. The no-argument overload has no
+per-transaction expiry and relies solely on the configured absolute floor; it is
+not a fresh percentage-slippage quote.
 
 Useful read methods and events:
 
@@ -130,8 +141,8 @@ Useful read methods and events:
   Unused IDs return the mapping default; they are not entries.
 - `mintCountOf(payer)` and `totalTokensReceived(payer)` provide aggregate history.
 - `leader()`, `lowestTokens()` and `winningMintId()` identify the current minimum.
-- `poolKey()`, `minimumOutput()`, `closesAt()`, `minted()` and `finalized()` expose
-  configuration and lifecycle state.
+- `poolKey()`, `poolId()`, `minimumOutput()`, `closesAt()`, `minted()` and
+  `finalized()` expose configuration and lifecycle state.
 - `rewardPool()` is the open-game liability, `pendingReward()` the deferred
   winner claim, and `totalRewardsPaid()` the amount already paid.
 - `Minted`, `LeaderChanged`, `GameStarted`, `GameFinalized`, `RewardPaid` and
@@ -148,11 +159,16 @@ The last successful mint automatically finalizes the game, includes its own 0.02
 ETH contribution, and attempts payment to the winning payer. `finalize()` uses the
 same flow after timeout. Both freeze the winner before making any ETH call.
 
-Automatic payment forwards `AUTO_PAYOUT_GAS = 30,000` gas. If there is less than
-100,000 gas remaining before the attempt, or the winner rejects payment or runs
-out of its gas allowance, the game remains finalized and emits `RewardDeferred`.
-The entire prize remains reserved in `pendingReward`; the final entry is not
-cancelled. Only the winning payer may call:
+Automatic payment forwards `AUTO_PAYOUT_GAS = 30,000` gas and discards the
+winner's return data without copying it, so a winner cannot make settlement cost
+more than that allowance. The settling transaction must have at least 100,000 gas
+left when payment is attempted; otherwise the whole call reverts with
+`InsufficientGasForPayout` and the final entry or `finalize()` must be resubmitted
+with more gas. The caller who settles therefore cannot choose a gas limit that
+pushes a cooperative winner into the pull path. Only when the winner itself rejects
+payment or runs out of its 30,000 gas allowance does the game stay finalized and
+emit `RewardDeferred`. The entire prize then remains reserved in `pendingReward`;
+the final entry is not cancelled. Only the winning payer may call:
 
 ```solidity
 game.claimRewards(payable(recipient));
@@ -196,6 +212,43 @@ The output floor and per-call deadline limit an individual trade's execution;
 they do not prove a fair market price or prevent reward manipulation. Private
 transaction routing does not remove this economic incentive. This is not a fair
 lottery or a manipulation-resistant randomness system.
+
+### Open decision for the requester: price manipulation captures the prize
+
+Independent review reproduced the consequence of the rule above with the real v4
+core: a trader who, in one block, buys enough IMD to move the pool price, mints
+the final entry at the moved price, and sells the IMD back, receives a receipt below
+every honest entry and is paid the whole pot inside the same sequence. In the
+review's fixture (1000e18 liquidity, 3000 fee) a 20 ETH push cost about 0.14 ETH
+in fees and won 2 ETH. The same works at the deadline with `finalize()`.
+
+This is a property of the requested rule, not of a missing check. Any winner
+ranking read from the spot swap can be hit by whoever moves the spot price:
+
+- A **bound on price drift** between entries, or a relative slippage band, is bypassed
+  by a smaller push that stays inside the band; a band tight enough to block that
+  also blocks ordinary price movement over the 30-day game.
+- **Scoring against the pre-swap spot price** makes a push in the attacker's favour
+  useless but rewards a push in the opposite direction or a liquidity withdrawal,
+  and makes all entries in a deep pool tie so that the first entry always wins.
+- **Reference prices from earlier blocks** make the attack easier, because the
+  attacker's execution still happens at the moved price while the reference does not.
+
+The contract therefore keeps the rule as requested and leaves the decision to the
+requester. Options, each a rule change that needs a new build and tests:
+
+1. **Accept it as the game.** Whoever buys at the worst price wins, including someone
+   who makes the price bad for themselves. Publish this plainly to players.
+2. **Verifiable randomness.** Select the winner among entries with Chainlink VRF,
+   optionally weighted toward smaller receipts. The "fewest tokens" receipt becomes a
+   weight or a tiebreak instead of the sole rule.
+3. **Delayed, bounded execution.** Pay 0.1 ETH now, execute the swap in a later block
+   within a tolerance of the price at commitment. This raises the attacker's cost
+   and exposure but does not remove the attack, and the IMD no longer arrives in the
+   same transaction as the click.
+
+Until the requester chooses, the pot should be regarded as winnable by the best
+capitalised trader, and the game should not be marketed as fair to passive players.
 
 These tradeoffs preserve the requested lowest-output rule. Before production use,
 an independent contributor must review the contract and the actual IMD token,

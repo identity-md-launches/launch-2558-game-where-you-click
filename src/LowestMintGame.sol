@@ -37,6 +37,7 @@ contract LowestMintGame is Ownable2Step, ReentrancyGuard, IUnlockCallback {
 
     IPoolManager public immutable poolManager;
     PoolKey public poolKey;
+    bytes32 public poolId;
     uint256 public minimumOutput;
     bool public configured;
 
@@ -65,6 +66,7 @@ contract LowestMintGame is Ownable2Step, ReentrancyGuard, IUnlockCallback {
     error DependencyHasNoCode();
     error PoolNotInitialized();
     error InvalidMinimumOutput();
+    error PoolMismatch(bytes32 expected, bytes32 actual);
     error IncorrectPayment();
     error GameClosed();
     error DeadlineExpired();
@@ -82,6 +84,7 @@ contract LowestMintGame is Ownable2Step, ReentrancyGuard, IUnlockCallback {
     error NotWinner();
     error NothingToClaim();
     error InvalidRecipient();
+    error InsufficientGasForPayout(uint256 remaining, uint256 required);
     error RewardTransferFailed();
     error DirectPaymentNotAllowed();
 
@@ -125,15 +128,11 @@ contract LowestMintGame is Ownable2Step, ReentrancyGuard, IUnlockCallback {
         if (sqrtPriceX96 == 0) revert PoolNotInitialized();
 
         poolKey = key;
+        poolId = PoolId.unwrap(key.toId());
         minimumOutput = minimumOutput_;
         configured = true;
         emit PoolConfigured(
-            PoolId.unwrap(key.toId()),
-            Currency.unwrap(key.currency1),
-            key.fee,
-            key.tickSpacing,
-            address(key.hooks),
-            minimumOutput_
+            poolId, Currency.unwrap(key.currency1), key.fee, key.tickSpacing, address(key.hooks), minimumOutput_
         );
     }
 
@@ -152,6 +151,21 @@ contract LowestMintGame is Ownable2Step, ReentrancyGuard, IUnlockCallback {
         returns (uint256 mintId, uint256 tokensReceived)
     {
         if (minTokensReceived == 0) revert InvalidMinimumOutput();
+        return _mint(minTokensReceived, deadline);
+    }
+
+    /// @notice Buy an entry bound to the pool the caller quoted against, with a minimum and a deadline.
+    /// @dev Reverts if the owner replaced the configured pool between the quote and execution, which is
+    ///      possible only while no entry exists. `expectedPoolId` is `poolId()` or the v4 pool ID of the key.
+    function mint(bytes32 expectedPoolId, uint256 minTokensReceived, uint256 deadline)
+        external
+        payable
+        nonReentrant
+        returns (uint256 mintId, uint256 tokensReceived)
+    {
+        if (minTokensReceived == 0) revert InvalidMinimumOutput();
+        if (!configured) revert NotConfigured();
+        if (expectedPoolId != poolId) revert PoolMismatch(expectedPoolId, poolId);
         return _mint(minTokensReceived, deadline);
     }
 
@@ -241,18 +255,26 @@ contract LowestMintGame is Ownable2Step, ReentrancyGuard, IUnlockCallback {
         pendingReward = amount;
         emit GameFinalized(leader, winningMintId, amount, minted == MAX_MINTS);
 
-        // A rejecting or gas-consuming winner must not block the final mint or deadline settlement.
-        if (gasleft() >= PAYOUT_GAS_RESERVE) {
-            pendingReward = 0;
-            (bool paid,) = payable(leader).call{value: amount, gas: AUTO_PAYOUT_GAS}("");
-            if (paid) {
-                totalRewardsPaid += amount;
-                emit RewardPaid(leader, leader, amount);
-                return;
-            }
-            pendingReward = amount;
+        // The settling caller must leave enough gas for the full payout attempt. Reverting here, rather
+        // than silently deferring, stops a third party from choosing a gas limit that strands a
+        // cooperative winner's prize in the pull path.
+        uint256 remaining = gasleft();
+        if (remaining < PAYOUT_GAS_RESERVE) revert InsufficientGasForPayout(remaining, PAYOUT_GAS_RESERVE);
+        pendingReward = 0;
+        address winner = leader;
+        bool paid;
+        // Return data is never copied, so a winner cannot inflate this call's cost beyond its gas allowance.
+        // A rejecting or gas-consuming winner still cannot block the final mint or deadline settlement.
+        assembly ("memory-safe") {
+            paid := call(AUTO_PAYOUT_GAS, winner, amount, 0, 0, 0, 0)
         }
-        emit RewardDeferred(leader, amount);
+        if (paid) {
+            totalRewardsPaid += amount;
+            emit RewardPaid(winner, winner, amount);
+            return;
+        }
+        pendingReward = amount;
+        emit RewardDeferred(winner, amount);
     }
 
     /// @notice The winning payer can redirect a deferred prize to an ETH-capable wallet.

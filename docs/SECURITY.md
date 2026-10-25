@@ -27,12 +27,12 @@ take constant work. At most 100 receipts and one eventual winner claim exist.
 | Boundary | Protection and remaining assumption |
 | --- | --- |
 | Factory / deployment | Explicit owner argument, nonpayable constructor, no external constructor calls, immutable public manager dependency. Tests reproduce empty-chain deployment and scan reachable runtime opcodes. |
-| Owner / configuration | Owner-only setter, live code and initialized-pool checks, event with complete settings, frozen after first success. Before then, the owner can select any eligible pool and floor; users must verify identity, not just the token symbol. |
+| Owner / configuration | Owner-only setter, live code and initialized-pool checks, event with complete settings, frozen after first success. Before then, the owner can select any eligible pool and floor; users must verify identity, not just the token symbol. A reconfiguration mined ahead of a pending first entry would otherwise redirect that entry's 0.08 ETH into the new pool and freeze the game there; the pool-bound `mint(bytes32,uint256,uint256)` overload reverts with `PoolMismatch` in that case, and `poolId()` publishes the value to bind. |
 | Payer / callback | Reentrancy guard spans swap, accounting and payout. Callback requires the exact manager, active mint guard and one-use payer context. No arbitrary payer or recipient can be injected in callback bytes. |
 | Swap / reward custody | Fixed negative exact-input amount; returned native debit must be exactly 0.08 ETH. Partial fills and unexpected hook input deltas revert before settlement. A hook's ERC20 sync is reset to native. Existing rewards cannot finance a swap. |
 | Token / score | Snapshot immediately around manager-to-payer transfer, require receipt equals positive delta, then record measured increase. Fee-on-transfer, bonus/rebasing delivery and false/reverting transfers fail atomically. Honest ERC20 balance reporting is required. |
 | Hook / score | Hook effects are already included in returned v4 deltas. Output fees can lower receipt and influence score. A reviewed hook must accept empty data and the game as caller. Permission bits do not establish that a hook is safe. |
-| Prize / recipient | Finalized state and zeroed claim precede ETH calls. Automatic gas is bounded and failures preserve a pull claim. A failed manual claim restores accounting by revert. No loser or owner may claim another payer's prize. |
+| Prize / recipient | Finalized state and zeroed claim precede ETH calls. Automatic payment is a raw `call` with a 30,000 gas allowance and zero-length return buffer, so a winner returning large data cannot raise the settler's cost (previously the copied return data could push the final mint out of gas near the reserve). Settlement reverts with `InsufficientGasForPayout` when fewer than 100,000 gas remain, so the settling caller cannot pick a gas limit that strands a cooperative winner in the pull path; only the winner's own rejection or gas exhaustion defers the prize. A failed manual claim restores accounting by revert. No loser or owner may claim another payer's prize. |
 | Time / liveness | Fixed 30-day cutoff from first entry. No entry at the cutoff. Anyone can settle then, without touching the token or manager. No keeper is built in. Timestamp ordering near the boundary is not a randomness source. |
 | Administrative lifecycle | Two-step transfer. No pause, upgrade, emergency withdrawal, reset or winner rewrite. Renouncing before configuration prevents opening; renouncing after configuration does not block players. |
 | Unsolicited funds | Direct ETH rejected; forced ETH never changes entry count or rewards. Forced ETH and accidentally sent tokens cannot be rescued. |
@@ -56,12 +56,24 @@ and no external sells, each of 100 consecutive 0.08 ETH buys yields less IMD, so
 advantage sooner. Removing this incentive would require changing the requested
 selection rule; it is not silently treated as solved by slippage checks.
 
+Independent review (finding `edc49aea…`) made this concrete with unmodified v4
+core: after 99 honest entries, one actor buys 20 ETH of IMD, mints the 100th entry
+at the moved price, sells the IMD back and nets about +1.86 ETH from the 2 ETH pot,
+all in one block. The same works at the deadline through `finalize()`. The review
+asked for the requester's decision rather than a unilateral rule change, and this
+revision does not change the rule. The README section "Open decision for the
+requester" records why drift bands, relative-to-spot scoring and stale reference
+prices do not remove the attack and lists the rule changes that would.
+
 ## Evidence and open operational work
 
 Unit tests cover exact payment, unconfigured operation, setter authorization and
 locking, transfer semantics, payment conservation, ties, repeats, final-entry
 accounting, late entry, partial fills, minimum output, deadlines, callback forgery,
-missing/duplicate callbacks, reentrancy, rejected prizes, gas exhaustion and retry.
+missing/duplicate callbacks, reentrancy, rejected prizes, gas exhaustion and retry,
+pool-bound entries against a replaced configuration, a return-bombing winner at the
+minimum settling gas, and a scan of final-mint gas limits that must end in either a
+clean revert or a full payment, never a deferral.
 Integration tests deploy unmodified v4 core locally and fund actual liquidity,
 exercise price movement, compare receipts to balances, and verify rollback of pool
 state. Hook integration tests cover dynamic fees, output fees, reentry and native

@@ -1,19 +1,19 @@
 # Local validation
 
 Compiler: Solidity **0.8.26**, pinned in `foundry.toml`. Cancun EVM, optimizer 200
-runs, metadata bytecode hash disabled. Application runtime: **8,055 bytes**, below
+runs, metadata bytecode hash disabled. Application runtime: **8,303 bytes**, below
 the 24,576-byte EIP-170 limit, with no unresolved library placeholders.
 
-Completed checks:
+Completed checks (revision of 2026-10-25):
 
 | Check | Result |
 | --- | --- |
 | `forge build` | Pass |
-| `forge test` with supplied seed | 62 passed; 0 failed; 0 skipped |
+| `forge test` with supplied seed | 64 passed; 0 failed; 0 skipped (forge reports the three invariants as one entry) |
 | `forge fmt --check` | Pass |
-| Clean rebuild using `forge build --offline` | Pass |
-| `forge test --offline -j 4` with cleared environment and supplied seed | 62 passed; 0 failed; 0 skipped |
-| Vendored Solidity source comparison against pinned archives | All retained files match upstream bytes |
+| `forge test --offline` with cleared environment and supplied seed | 64 passed; 0 failed; 0 skipped |
+| Vendored Solidity source comparison against pinned archives (first round) | All retained files match upstream bytes |
+| Reviewer proof `Proof_edc49aeafc12` (price manipulation) | Still fails by design; answered as disputed, see README "Open decision for the requester" |
 
 The cleared-environment run supplies only the executable search path and fuzz seed;
 it does not preserve project secrets, RPC configuration or account settings. Tests
@@ -28,7 +28,10 @@ forge fmt --check
 
 Test distribution:
 
-- 45 unit/fuzz tests of game behavior, configuration, rollback and payouts.
+- 49 unit/fuzz tests of game behavior, configuration, rollback and payouts,
+  including the revision's regressions: a gas-limit scan of the final mint that
+  must end in a clean revert or a full payment, a return-bombing winner settled at
+  the EOA minimum gas, and pool-bound entries against a replaced configuration.
 - 13 integration/fuzz tests using real, locally deployed Uniswap v4 core,
   initialized pools, liquidity and representative hooks.
 - 1 empty-chain constructor/runtime policy test, reflecting the supplied

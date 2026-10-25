@@ -7,6 +7,7 @@ import {MockIMD, PlayerWallet} from "./helpers/Mocks.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
@@ -240,6 +241,67 @@ contract LowestMintGameTest is GameFixture {
         _assertEmpty();
     }
 
+    function test_poolBoundMintRejectsConfigurationReplacedAfterTheQuote() public {
+        MockIMD other = new MockIMD();
+        other.mint(address(manager), 1e36);
+        PoolKey memory otherKey =
+            PoolKey(Currency.wrap(address(0)), Currency.wrap(address(other)), 3000, 60, IHooks(address(0)));
+        bytes32 quotedPool = game.poolId();
+        assertEq(quotedPool, PoolId.unwrap(key.toId()));
+
+        // The owner may still replace the pool while no entry exists; a quote-bound entry then fails closed.
+        vm.prank(owner);
+        game.configurePool(otherKey, 1);
+        bytes32 replacedPool = game.poolId();
+        assertNotEq(replacedPool, quotedPool);
+        manager.setOutput(1e18);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(LowestMintGame.PoolMismatch.selector, quotedPool, replacedPool));
+        game.mint{value: PRICE}(quotedPool, 0.079e18, block.timestamp);
+        assertEq(game.minted(), 0);
+        assertEq(other.balanceOf(alice), 0);
+        assertEq(alice.balance, 100 ether);
+
+        // Once the quoted pool is back, the same bound entry executes and freezes that configuration.
+        vm.prank(owner);
+        game.configurePool(key, 100);
+        vm.prank(alice);
+        (uint256 id, uint256 received) = game.mint{value: PRICE}(quotedPool, 0.079e18, block.timestamp);
+        assertEq(id, 1);
+        assertEq(received, 1e18);
+        assertEq(token.balanceOf(alice), 1e18);
+        assertEq(other.balanceOf(alice), 0);
+        vm.prank(owner);
+        vm.expectRevert(LowestMintGame.ConfigurationLocked.selector);
+        game.configurePool(otherKey, 1);
+    }
+
+    function test_poolBoundMintKeepsFloorDeadlineAndConfigurationChecks() public {
+        bytes32 id = game.poolId();
+        vm.prank(alice);
+        vm.expectRevert(LowestMintGame.InvalidMinimumOutput.selector);
+        game.mint{value: PRICE}(id, 0, block.timestamp);
+        LowestMintGame unconfigured = new LowestMintGame(owner, IPoolManager(address(manager)));
+        assertEq(unconfigured.poolId(), bytes32(0));
+        vm.prank(alice);
+        vm.expectRevert(LowestMintGame.NotConfigured.selector);
+        unconfigured.mint{value: PRICE}(bytes32(0), 100, block.timestamp);
+        vm.prank(alice);
+        vm.expectRevert(LowestMintGame.DeadlineExpired.selector);
+        game.mint{value: PRICE}(id, 100, block.timestamp - 1);
+        manager.setOutput(150);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(LowestMintGame.TooFewTokens.selector, 150, 200));
+        game.mint{value: PRICE}(id, 200, block.timestamp);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(LowestMintGame.TooFewTokens.selector, 150, 151));
+        game.mint{value: PRICE}(id, 151, block.timestamp);
+        vm.prank(alice);
+        game.mint{value: PRICE}(id, 150, block.timestamp);
+        assertEq(game.minted(), 1);
+        assertEq(game.lowestTokens(), 150);
+    }
+
     function test_exactDeadlineIsAllowed() public {
         vm.prank(alice);
         game.mint{value: PRICE}(1000, block.timestamp);
@@ -469,16 +531,74 @@ contract LowestMintGameTest is GameFixture {
         assertEq(carol.balance, 100 ether + REWARD);
     }
 
-    function test_lowGasSettlementDefersPrizeWithoutLosingClaim() public {
+    function test_lowGasSettlementRevertsInsteadOfDeferringThePrize() public {
         _mint(alice, 500);
         vm.warp(game.closesAt());
-        game.finalize{gas: 100_000}();
+        (bool success, bytes memory result) = address(game).call{gas: 100_000}(abi.encodeCall(game.finalize, ()));
+        assertFalse(success);
+        assertEq(bytes4(result), LowestMintGame.InsufficientGasForPayout.selector);
+        assertFalse(game.finalized());
+        assertEq(game.rewardPool(), REWARD);
+        assertEq(game.pendingReward(), 0);
+        game.finalize();
         assertTrue(game.finalized());
-        assertEq(game.pendingReward(), REWARD);
-        assertEq(game.totalRewardsPaid(), 0);
-        vm.prank(alice);
-        game.claimRewards(payable(alice));
+        assertEq(game.pendingReward(), 0);
+        assertEq(game.totalRewardsPaid(), REWARD);
         assertEq(alice.balance, 100 ether - PRICE + REWARD);
+    }
+
+    function test_finalMintGasLimitCannotForceDeferralForCooperativeWinner() public {
+        _mint(alice, 100);
+        manager.setOutput(200);
+        for (uint256 i; i < 98; ++i) {
+            vm.prank(bob);
+            game.mint{value: PRICE}();
+        }
+        assertEq(game.minted(), 99);
+        // Whatever gas limit the competing final minter chooses, the outcome is either a clean revert
+        // that leaves the game open or a settlement that pays the EOA winner in full. Never a deferral.
+        bool settled;
+        for (uint256 gasLimit = 120_000; gasLimit <= 800_000 && !settled; gasLimit += 1_000) {
+            vm.prank(bob);
+            (settled,) = address(game).call{value: PRICE, gas: gasLimit}(abi.encodeWithSignature("mint()"));
+            if (!settled) {
+                assertEq(game.minted(), 99);
+                assertFalse(game.finalized());
+                assertEq(game.rewardPool(), 99 * REWARD);
+                assertEq(game.pendingReward(), 0);
+            }
+        }
+        assertTrue(settled, "final mint never fit the gas range");
+        assertTrue(game.finalized());
+        assertEq(game.pendingReward(), 0);
+        assertEq(game.totalRewardsPaid(), 2 ether);
+        assertEq(alice.balance, 100 ether - PRICE + 2 ether);
+        assertEq(bob.balance, 100 ether - 99 * PRICE);
+    }
+
+    function test_returnBombingWinnerCannotRaiseSettlementGasAboveTheReserve() public {
+        _mint(alice, 100);
+        vm.warp(game.closesAt());
+        uint256 eoaGas = _minimumFinalizeGas(game);
+        assertEq(game.totalRewardsPaid(), REWARD);
+
+        LowestMintGame bombed = new LowestMintGame(owner, IPoolManager(address(manager)));
+        vm.prank(owner);
+        bombed.configurePool(key, 100);
+        PlayerWallet bomber = new PlayerWallet(bombed);
+        bomber.setReceiveMode(PlayerWallet.ReceiveMode.ReturnBomb);
+        manager.setOutput(100);
+        bomber.enter{value: PRICE}();
+        assertEq(bombed.leader(), address(bomber));
+        vm.warp(bombed.closesAt());
+        // The same gas that settles an EOA winner settles a winner returning 100 KB: the game never
+        // copies return data, so the winner's behaviour costs the settler nothing beyond the allowance.
+        (bool success,) = address(bombed).call{gas: eoaGas}(abi.encodeCall(bombed.finalize, ()));
+        assertTrue(success, "return bomb raised the settlement gas requirement");
+        assertTrue(bombed.finalized());
+        assertEq(bombed.totalRewardsPaid(), REWARD);
+        assertEq(bombed.pendingReward(), 0);
+        assertEq(address(bomber).balance, REWARD);
     }
 
     function test_autoPayoutAndClaimReentrancyCannotDoublePay() public {
@@ -564,6 +684,16 @@ contract LowestMintGameTest is GameFixture {
         vm.prank(owner);
         vm.expectRevert(LowestMintGame.InvalidPool.selector);
         game.configurePool(wrong, 100);
+    }
+
+    /// @dev Smallest gas limit, in 500-gas steps, at which `finalize()` on an open-at-deadline game succeeds.
+    function _minimumFinalizeGas(LowestMintGame target) private returns (uint256 gasLimit) {
+        for (gasLimit = 60_000; gasLimit <= 600_000; gasLimit += 500) {
+            (bool success,) = address(target).call{gas: gasLimit}(abi.encodeCall(target.finalize, ()));
+            if (success) return gasLimit;
+            assertFalse(target.finalized());
+        }
+        revert("finalize never fit the gas range");
     }
 
     function _walletLeader(PlayerWallet.ReceiveMode mode) private returns (PlayerWallet wallet) {

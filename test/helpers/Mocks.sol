@@ -152,7 +152,8 @@ contract PlayerWallet {
         Accept,
         Reject,
         BurnGas,
-        Reenter
+        Reenter,
+        ReturnBomb
     }
 
     LowestMintGame public game;
@@ -185,6 +186,12 @@ contract PlayerWallet {
         if (receiveMode == ReceiveMode.Reenter) {
             (bool success,) = address(game).call(abi.encodeCall(game.claimRewards, (payable(address(this)))));
             require(!success, "reentrant claim succeeded");
+        }
+        if (receiveMode == ReceiveMode.ReturnBomb) {
+            // Accepts the ETH within its gas allowance but hands back 100 KB of return data.
+            assembly {
+                return(0, 100000)
+            }
         }
         payouts++;
     }
