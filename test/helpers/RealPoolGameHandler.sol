@@ -76,9 +76,13 @@ contract RealPoolGameHandler is Test {
             uint256 beforeTokens = token.balanceOf(actors[index]);
             uint256 beforeManagerETH = address(manager).balance;
             uint256 beforeManagerTokens = token.balanceOf(address(manager));
+            bytes32 quotedPool = game.poolId();
             vm.prank(actors[index]);
-            (uint256 id, uint256 reported) =
-                quoted ? game.mint{value: 0.1 ether}(1e12, block.timestamp) : game.mint{value: 0.1 ether}();
+            (uint256 id, uint256 reported) = !quoted
+                ? game.mint{value: 0.1 ether}()
+                : i % 2 == 0
+                    ? game.mint{value: 0.1 ether}(1e12, block.timestamp)
+                    : game.mint{value: 0.1 ether}(quotedPool, 1e12, block.timestamp);
             _assertSettled(address(game));
             uint256 received = token.balanceOf(actors[index]) - beforeTokens;
             assertGe(received, 1e12, "configured floor");
@@ -93,7 +97,7 @@ contract RealPoolGameHandler is Test {
             lifetimeTokens[index] += received;
             expectedETH[index] -= 0.1 ether;
             ++entryCounts[index];
-            if (entries() == 100) _close(false);
+            if (entries() == 100) _close();
         }
     }
 
@@ -127,7 +131,7 @@ contract RealPoolGameHandler is Test {
     }
 
     function rejectMint(uint8 actorSeed, uint8 modeSeed, uint96 paymentSeed) public {
-        uint256 mode = modeSeed % 5;
+        uint256 mode = modeSeed % 6;
         uint256 value = 0.1 ether;
         bytes memory data;
         bytes4 errorSelector;
@@ -139,6 +143,12 @@ contract RealPoolGameHandler is Test {
         } else if (mode == 1) {
             data = abi.encodeWithSignature("mint(uint256,uint256)", 0, block.timestamp);
             errorSelector = LowestMintGame.InvalidMinimumOutput.selector;
+        } else if (mode == 5) {
+            // A quote bound to a different pool is refused before any swap, open or closed.
+            data = abi.encodeWithSignature(
+                "mint(bytes32,uint256,uint256)", ~game.poolId(), uint256(1e12), block.timestamp
+            );
+            errorSelector = LowestMintGame.PoolMismatch.selector;
         } else {
             bool ended = closed || (deadline != 0 && block.timestamp >= deadline);
             if (mode == 2) {
@@ -183,9 +193,19 @@ contract RealPoolGameHandler is Test {
             vm.expectRevert(LowestMintGame.GameStillOpen.selector);
             game.finalize();
         } else {
-            if (lowGas) game.finalize{gas: 100_000}();
-            else game.finalize();
-            _close(lowGas);
+            if (lowGas) {
+                // A settler cannot pick a gas limit that silently defers a cooperative winner's prize.
+                uint256 poolBefore = game.rewardPool();
+                (bool success, bytes memory reason) =
+                    address(game).call{gas: 100_000}(abi.encodeCall(game.finalize, ()));
+                assertFalse(success, "underfunded settlement accepted");
+                assertEq(bytes4(reason), LowestMintGame.InsufficientGasForPayout.selector);
+                assertFalse(game.finalized());
+                assertEq(game.rewardPool(), poolBefore);
+                assertEq(game.pendingReward(), 0);
+            }
+            game.finalize();
+            _close();
         }
     }
 
@@ -246,10 +266,11 @@ contract RealPoolGameHandler is Test {
         if (paid == 0) claim(uint8(winnerIndex()), 0);
     }
 
-    function _close(bool lowGas) private {
+    function _close() private {
         closed = true;
         uint256 index = winnerIndex();
-        if (!lowGas && index != 3) {
+        // Only the ETH-rejecting wallet (actor 3) is left with a deferred, claimable prize.
+        if (index != 3) {
             paid = entries() * 0.02 ether;
             expectedETH[index] += paid;
         }

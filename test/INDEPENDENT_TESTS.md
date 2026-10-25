@@ -23,10 +23,15 @@ cross-function reentrancy, ownership changes and payout event data.
 
 `RealPoolInvariant.t.sol` deploys the unmodified vendored PoolManager and funds a
 local ETH/test-token liquidity position. `RealPoolGameHandler` drives eight actions
-in random order: purchases through both overloads, outside buys/sells, token
+in random order: purchases through all three overloads (including the
+pool-ID-bound quote), outside buys/sells, token
 transfers between players, invalid purchases, time advances, finalization, claims,
 and forced surplus. Four payers include a wallet that rejects ETH. Inputs are
-bounded; expected failures assert their error selectors. Unexpected reverts fail
+bounded; expected failures assert their error selectors, including
+`PoolMismatch` for a quote bound to another pool. A settlement attempt with
+too little gas must revert with `InsufficientGasForPayout` and leave the game
+open and the pot intact; it may not defer a cooperative winner's prize. Only the
+ETH-rejecting wallet ends with a deferred, claimable reward. Unexpected reverts fail
 the campaign. Inline configuration requests 256 runs of 96 calls.
 
 The three invariant functions check:
@@ -46,7 +51,8 @@ swaps. It inspects v4 locks and currency debts inside the same transaction as th
 swap, before Forge 1.8 clears transient storage. `afterInvariant` closes any started
 game and collects any deferred reward to check withdrawal liveness after every
 campaign. Deterministic scenarios exercise sellout with a rejecting winner,
-invalid/repeated claims, both market directions, transfers and deferred payment.
+invalid/repeated claims, both market directions, transfers, an underfunded
+settlement attempt followed by a funded one, and deferred payment.
 
 The token and pool key are local fixtures, not claims about a particular live IMD
 deployment. Market manipulation resistance is not asserted: outside trades are

@@ -195,19 +195,21 @@ contract RealPoolInvariantTest is Test {
         handler.moveTokens(0, 1, uint128(token.balanceOf(handler.actors(0))));
         assertEq(token.balanceOf(handler.actors(0)), 0);
         assertEq(game.leader(), handler.actors(0), "selling tokens does not forfeit recorded entry");
-        for (uint8 mode; mode < 5; ++mode) {
+        for (uint8 mode; mode < 6; ++mode) {
             handler.rejectMint(2, mode, 1);
         }
         _assertAll();
         assertEq(handler.marketTrades(), 2);
         assertEq(handler.tokenMoves(), 1);
-        assertEq(handler.rejectedMints(), 5);
+        assertEq(handler.rejectedMints(), 6);
         vm.warp(handler.deadline());
-        handler.settle(true);
+        handler.settle(true); // underfunded attempt reverts, then a funded one pays the EOA winner
         _assertAll();
-        assertEq(game.pendingReward(), 0.04 ether);
+        assertEq(game.pendingReward(), 0);
+        assertEq(game.totalRewardsPaid(), 0.04 ether);
         handler.forceSurplus(1 ether);
-        handler.claim(0, 2);
+        handler.claim(0, 2); // nothing deferred, so nothing to claim
+        handler.claim(0, 0);
         _assertAll();
         assertEq(address(game).balance, 1 ether);
     }
